@@ -44,6 +44,60 @@ Note that `X` and `y` must be PyTorch tensors. Other than that, the `LinearTreeR
 
 Please see the notebooks folder for basic tutorials on these models.
 
+## Leaf regularization
+
+By default, leaf regressions use the existing ridge-style closed-form torch
+solve:
+
+```python
+model = HyperplaneTreeRegressor(leaf_regularization="ridge")
+```
+
+Sparse leaf models can be enabled with Lasso or Elastic-Net:
+
+```python
+lasso_model = LinearTreeRegressor(
+    leaf_regularization="lasso",
+    leaf_alpha=0.01,
+    max_iter=10000,
+    tol=1e-6,
+)
+
+elasticnet_model = HyperplaneTreeRegressor(
+    leaf_regularization="elasticnet",
+    leaf_alpha=0.01,
+    leaf_l1_ratio=0.7,
+    max_iter=10000,
+    tol=1e-6,
+    random_state=0,
+)
+```
+
+Sparse affine leaves can be easier to interpret because each region may depend
+on fewer variables. They can also simplify downstream OMLT/GDP formulations by
+removing near-zero coefficients from the affine model in each leaf.
+
+The legacy `ridge` argument is still supported. If `leaf_alpha` is not provided,
+`ridge` is used as the leaf regularization strength, so existing code keeps the
+same default behavior.
+
+Lasso and Elastic-Net leaves are fitted with scikit-learn (`Lasso` and
+`ElasticNet`). scikit-learn normalizes the squared-error term by
+`1 / (2 * n_samples)`, so `leaf_alpha` is not numerically identical to an
+unnormalized penalty in `sum_i residual_i^2 + lambda_1 ||coef||_1 +
+lambda_2 ||coef||_2^2`. Elastic-Net uses scikit-learn's `leaf_l1_ratio`
+convention, where `1.0` is Lasso-like and `0.0` is ridge-like. Because these
+solvers are iterative and are used while evaluating split candidates, they are
+slower than the default ridge solve.
+
+This repository contains its own forked hyperplanetree implementation under
+`systems2atoms/hyperplanetree/hyperplanetree`. The external `linear-tree`
+dependency is still used elsewhere for compatibility with existing
+linear-tree/OMLT workflows, but these options apply to
+`systems2atoms.hyperplanetree.LinearTreeRegressor` and
+`systems2atoms.hyperplanetree.HyperplaneTreeRegressor`; no site-packages copy of
+`linear-tree` is modified.
+
 ## Why Hyperplanes?
 TLDR: Expanding the search space of possible splits can allow us to build trees with better accuracy for the same number of leaves.
 

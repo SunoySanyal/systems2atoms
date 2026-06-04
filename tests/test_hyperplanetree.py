@@ -10,6 +10,21 @@ def generate_function(x, y, noise_scale = 0.1):
 
     return f.to(torch_device)
 
+def generate_sparse_linear_data(n_samples=80, n_features=6):
+    generator = torch.Generator()
+    generator.manual_seed(0)
+    X = torch.randn(n_samples, n_features, generator=generator)
+    noise = 0.01 * torch.randn(n_samples, generator=generator)
+    y = 3.0 * X[:, 0] - 2.0 * X[:, 2] + noise
+    return X.type(torch.float), y.type(torch.float)
+
+def leaf_coefficients(model):
+    coefs = []
+    for leaf in model._leaves.values():
+        coef = torch.as_tensor(leaf.model.coef_, dtype=torch.float)
+        coefs.append(coef.reshape(-1))
+    return coefs
+
 def test_hyperplanetree():
     # Generate sampling points
     x0 = torch.linspace(-3, 3, 20, device = torch_device)
@@ -60,3 +75,47 @@ def test_formulations():
 
     formulation = HyperplaneTreeGDPFormulation(definition)
     formulation = HyperplaneTreeHybridBigMFormulation(definition)
+
+def test_leaf_regularization_modes_fit_and_report_coefficients():
+    features, labels = generate_sparse_linear_data()
+
+    for regularization in ["ridge", "lasso", "elasticnet"]:
+        model = LinearTreeRegressor(
+            max_depth=1,
+            min_samples_leaf=20,
+            max_bins=4,
+            disable_tqdm=True,
+            leaf_regularization=regularization,
+            leaf_alpha=0.05,
+            leaf_l1_ratio=0.5,
+            max_iter=10000,
+            tol=1e-6,
+            random_state=0,
+        )
+        model.fit(features, labels)
+
+        predictions = model.predict(features[:5])
+        assert predictions.reshape(-1).shape == labels[:5].shape
+        assert len(model) >= 1
+
+        for coef in leaf_coefficients(model):
+            assert coef.numel() == features.shape[1]
+
+def test_l1_leaf_regularization_can_zero_coefficients():
+    features, labels = generate_sparse_linear_data()
+    model = LinearTreeRegressor(
+        max_depth=1,
+        min_samples_leaf=20,
+        max_bins=4,
+        disable_tqdm=True,
+        leaf_regularization="lasso",
+        leaf_alpha=0.5,
+        max_iter=10000,
+        tol=1e-6,
+        random_state=0,
+    )
+
+    model.fit(features, labels)
+    coefficients = torch.cat(leaf_coefficients(model))
+
+    assert torch.any(torch.abs(coefficients) <= 1e-6)

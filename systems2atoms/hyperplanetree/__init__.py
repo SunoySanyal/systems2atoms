@@ -22,5 +22,6 @@ from .hyperplanetree.uq import (
 )
 
 from .hyperplanetree._classes import (
+    make_leaf_regressor,
     plot_surrogate_2d,
 )

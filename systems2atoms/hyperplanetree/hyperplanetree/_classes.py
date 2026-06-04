@@ -3,14 +3,16 @@ from typing import Callable
 import warnings
 import json
 import numbers
+import numpy as np
 import scipy.sparse as sp
 import torch
 import sklearn
 from copy import deepcopy
 
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.tree import BaseDecisionTree
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import ElasticNet, Lasso, LinearRegression
 from sklearn.utils.validation import has_fit_parameter, check_is_fitted
 
 from tqdm.auto import tqdm
@@ -86,6 +88,27 @@ def _predict_branch(X, branch_history, mask=None):
 
     return mask
 
+def _validate_tree_input(model, X):
+    """Validate prediction inputs without relying on sklearn private APIs."""
+    if sp.issparse(X):
+        raise TypeError("Sparse input is not supported.")
+
+    if not isinstance(X, torch.Tensor):
+        X = torch.Tensor(X)
+
+    if X.ndim != 2:
+        raise ValueError(
+            f"Expected a 2D input array, got {X.ndim}D input instead."
+        )
+
+    if X.shape[1] < model.n_features_in_:
+        raise ValueError(
+            f"X has {X.shape[1]} features, but this model expects at least "
+            f"{model.n_features_in_} features."
+        )
+
+    return X.to(dtype=torch.float32)
+
 def recursive_to_device(_self, device):
     """Utility to move a model to another device"""
     if isinstance(_self, torch.Tensor):
@@ -133,6 +156,30 @@ class Node:
         self.model = model
         self.classes = classes
 
+def _normalize_leaf_regularization(regularization):
+    regularization = regularization.lower().replace("_", "-")
+    aliases = {
+        "ridge": "ridge",
+        "lasso": "lasso",
+        "elasticnet": "elasticnet",
+        "elastic-net": "elasticnet",
+    }
+    if regularization not in aliases:
+        raise ValueError(
+            'leaf_regularization must be one of "ridge", "lasso", or '
+            f'"elasticnet"; got {regularization!r}.'
+        )
+    return aliases[regularization]
+
+
+def _to_numpy(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return value
+
+
 class TorchLinearRegression(LinearRegression):
     """Linear regressor using PyTorch linear algebra operations
         Parameters
@@ -159,8 +206,9 @@ class TorchLinearRegression(LinearRegression):
         None
         """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, fit_intercept=True, ridge=1e-5):
+        super().__init__(fit_intercept=fit_intercept)
+        self.ridge = ridge
         self.scale_weight = 1
         self.scale_offset = 0
         self.target_scale_weight = 1
@@ -180,11 +228,15 @@ class TorchLinearRegression(LinearRegression):
         save_linear_propogation_uncertainty_parameters = False,
         save_quadratic_uncertainty_parameters = False,
         rescale = False,
-        ridge = 1e-5,
+        ridge = None,
         ):
 
         if not isinstance(x, torch.Tensor):
             x = torch.Tensor(x)
+        if not isinstance(y, torch.Tensor):
+            y = torch.Tensor(y)
+        if ridge is None:
+            ridge = self.ridge
 
         if rescale:
             epsilon = 1e-8  # Small value to avoid division by zero
@@ -284,17 +336,183 @@ class TorchLinearRegression(LinearRegression):
     # intercept_ and coef_ with numpy types for sklearn compatibility
     @property
     def intercept_(self):
+        if not self.fit_intercept:
+            if getattr(self, "params", None) is None:
+                return np.array(0.0)
+            if self.params.ndim > 1 and self.params.shape[-1] > 1:
+                return np.zeros(self.params.shape[-1])
+            return np.array(0.0)
         if isinstance(self.scale_offset, torch.Tensor):
-            return (self.params[0] * self.target_scale_weight + self.target_scale_offset - torch.sum(self.params[1:] * self.scale_offset * self.target_scale_weight)).numpy()
+            intercept = self.params[0] * self.target_scale_weight + self.target_scale_offset - torch.sum(self.params[1:] * self.scale_offset * self.target_scale_weight)
         else:
-            return (self.params[0] * self.target_scale_weight + self.target_scale_offset - torch.sum(self.params[1:] * torch.tensor(self.scale_offset) * self.target_scale_weight)).numpy()
+            intercept = self.params[0] * self.target_scale_weight + self.target_scale_offset - torch.sum(self.params[1:] * torch.tensor(self.scale_offset) * self.target_scale_weight)
+
+        intercept = intercept.detach().cpu().numpy()
+        return intercept.item() if intercept.size == 1 else intercept
     
     @property
     def coef_(self):
+        params = self.params[1:] if self.fit_intercept else self.params
         if isinstance(self.scale_weight, torch.Tensor):
-            return (self.params[1:] * self.scale_weight * self.target_scale_weight).numpy().T
+            coef = (params * self.scale_weight * self.target_scale_weight).detach().cpu().numpy().T
         else:
-            return (self.params[1:] * torch.tensor(self.scale_weight) * self.target_scale_weight).numpy().T
+            coef = (params * torch.tensor(self.scale_weight) * self.target_scale_weight).detach().cpu().numpy().T
+
+        return coef.reshape(-1) if coef.shape[0] == 1 else coef
+
+
+class SklearnLeafRegressor(BaseEstimator, RegressorMixin):
+    """Torch-friendly wrapper for sparse scikit-learn leaf regressors.
+
+    scikit-learn scales the least-squares term by ``1 / (2 * n_samples)``.
+    Therefore ``alpha`` is not the same as the unnormalized lambda in
+    ``sum_i residual_i^2 + lambda_1 ||coef||_1 + lambda_2 ||coef||_2^2``.
+    For ElasticNet, the approximate unnormalized penalties are
+    ``lambda_1 = 2 * n_samples * alpha * l1_ratio`` and
+    ``lambda_2 = n_samples * alpha * (1 - l1_ratio)``.
+    """
+
+    def __init__(
+        self,
+        regularization="lasso",
+        alpha=1e-5,
+        l1_ratio=0.5,
+        fit_intercept=True,
+        max_iter=1000,
+        tol=1e-4,
+        random_state=None,
+    ):
+        self.regularization = regularization
+        self.alpha = alpha
+        self.l1_ratio = l1_ratio
+        self.fit_intercept = fit_intercept
+        self.max_iter = max_iter
+        self.tol = tol
+        self.random_state = random_state
+        self._coef_padding = 0
+
+    def _make_estimator(self):
+        regularization = _normalize_leaf_regularization(self.regularization)
+        if regularization == "lasso":
+            return Lasso(
+                alpha=self.alpha,
+                fit_intercept=self.fit_intercept,
+                max_iter=self.max_iter,
+                tol=self.tol,
+                random_state=self.random_state,
+            )
+        if regularization == "elasticnet":
+            return ElasticNet(
+                alpha=self.alpha,
+                l1_ratio=self.l1_ratio,
+                fit_intercept=self.fit_intercept,
+                max_iter=self.max_iter,
+                tol=self.tol,
+                random_state=self.random_state,
+            )
+        raise ValueError("SklearnLeafRegressor only supports lasso and elasticnet.")
+
+    def fit(self, x, y, sample_weight=None):
+        x_np = np.asarray(_to_numpy(x))
+        y_np = np.asarray(_to_numpy(y))
+        self._reshape_output_to_column = y_np.ndim == 2 and y_np.shape[1] == 1
+        fit_y = y_np.ravel() if self._reshape_output_to_column else y_np
+
+        self.estimator_ = self._make_estimator()
+        if sample_weight is None:
+            self.estimator_.fit(x_np, fit_y)
+        else:
+            sample_weight_np = np.asarray(_to_numpy(sample_weight)).reshape(-1)
+            self.estimator_.fit(x_np, fit_y, sample_weight=sample_weight_np)
+
+        self.n_features_in_ = self.estimator_.n_features_in_
+        return self
+
+    def predict(self, x):
+        is_torch = isinstance(x, torch.Tensor)
+        device = x.device if is_torch else None
+        dtype = x.dtype if is_torch else None
+        x_np = np.asarray(_to_numpy(x))
+
+        pred = self.estimator_.predict(x_np)
+        if getattr(self, "_reshape_output_to_column", False) and pred.ndim == 1:
+            pred = pred.reshape(-1, 1)
+
+        if is_torch:
+            return torch.as_tensor(pred, device=device, dtype=dtype)
+        return pred
+
+    def expand_features(self, n_features):
+        """Pad reported coefficients with zeros for generated split features."""
+        self._coef_padding = max(0, n_features - self.n_features_in_)
+
+    def to(self, device):
+        return self
+
+    @property
+    def coef_(self):
+        coef = np.asarray(self.estimator_.coef_)
+        if self._coef_padding == 0:
+            return coef
+
+        if coef.ndim == 1:
+            padding = np.zeros(self._coef_padding, dtype=coef.dtype)
+            return np.concatenate((coef, padding))
+
+        padding = np.zeros((coef.shape[0], self._coef_padding), dtype=coef.dtype)
+        return np.concatenate((coef, padding), axis=1)
+
+    @property
+    def intercept_(self):
+        return self.estimator_.intercept_
+
+    @property
+    def params(self):
+        coef = np.asarray(self.coef_)
+        if coef.ndim == 1:
+            coef = coef.reshape(-1, 1)
+        else:
+            coef = coef.T
+
+        if not self.fit_intercept:
+            return torch.as_tensor(coef, dtype=torch.float32)
+
+        intercept = np.asarray(self.intercept_).reshape(1, -1)
+        return torch.as_tensor(np.vstack((intercept, coef)), dtype=torch.float32)
+
+
+def make_leaf_regressor(
+    regularization="ridge",
+    alpha=1e-5,
+    l1_ratio=0.5,
+    fit_intercept=True,
+    max_iter=1000,
+    tol=1e-4,
+    random_state=None,
+):
+    """Create a leaf regressor for LinearTree/HyperplaneTree leaves."""
+    regularization = _normalize_leaf_regularization(regularization)
+    if alpha is None:
+        alpha = 1e-5
+    if l1_ratio is None:
+        l1_ratio = 0.5
+    if alpha < 0:
+        raise ValueError(f"leaf_alpha must be non-negative; got {alpha}.")
+    if regularization == "ridge":
+        return TorchLinearRegression(fit_intercept=fit_intercept, ridge=alpha)
+
+    if regularization == "elasticnet" and not 0 <= l1_ratio <= 1:
+        raise ValueError(f"leaf_l1_ratio must be in [0, 1]; got {l1_ratio}.")
+
+    return SklearnLeafRegressor(
+        regularization=regularization,
+        alpha=alpha,
+        l1_ratio=l1_ratio,
+        fit_intercept=fit_intercept,
+        max_iter=max_iter,
+        tol=tol,
+        random_state=random_state,
+    )
 
 
 class _LinearTree(BaseDecisionTree):
@@ -303,15 +521,32 @@ class _LinearTree(BaseDecisionTree):
     Warning: This class should not be used directly. Use derived classes
     instead.
     """
-    def __init__(self, base_estimator = TorchLinearRegression(), *, criterion, max_depth,
+    def __init__(self, base_estimator = None, *, criterion, max_depth,
                  min_samples_split, min_samples_leaf, max_bins,
                  min_impurity_decrease, categorical_features,
                  split_features, linear_features, disable_tqdm,
                  save_linear_propogation_uncertainty_parameters,
                  save_quadratic_uncertainty_parameters,
-                 max_batch_size, depth_first, ridge):
+                 max_batch_size, depth_first, ridge,
+                 leaf_regularization, leaf_alpha, leaf_l1_ratio,
+                 fit_intercept, max_iter, tol, random_state):
 
-        self.base_estimator = base_estimator
+        self.leaf_regularization = _normalize_leaf_regularization(leaf_regularization)
+        self.leaf_alpha = ridge if leaf_alpha is None else leaf_alpha
+        self.leaf_l1_ratio = leaf_l1_ratio
+        self.fit_intercept = fit_intercept
+        self.max_iter = max_iter
+        self.tol = tol
+        self.random_state = random_state
+        self.base_estimator = base_estimator or make_leaf_regressor(
+            regularization=self.leaf_regularization,
+            alpha=self.leaf_alpha,
+            l1_ratio=self.leaf_l1_ratio,
+            fit_intercept=self.fit_intercept,
+            max_iter=self.max_iter,
+            tol=self.tol,
+            random_state=self.random_state,
+        )
         self.criterion = criterion
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
@@ -334,6 +569,98 @@ class _LinearTree(BaseDecisionTree):
             self.loss_func = criteria.get(criterion)
             if self.loss_func is None:
                 raise NotImplementedError(f'Unknown loss function "{criterion}". Consider passing a callable function as criterion.')
+
+    def _validate_data(self, X, y=None, reset=True, **check_params):
+        """Compatibility shim for sklearn versions without BaseEstimator._validate_data."""
+        X = _validate_tree_input(self, X)
+
+        if y is None or (isinstance(y, str) and y == "no_validation"):
+            return X
+
+        if not isinstance(y, torch.Tensor):
+            y = torch.Tensor(y)
+        return X, y
+
+    def _fit_leaf_model(
+        self,
+        model,
+        X,
+        y,
+        weights=None,
+        save_linear_propogation_uncertainty_parameters=False,
+        save_quadratic_uncertainty_parameters=False,
+    ):
+        fit_kwargs = {}
+        if weights is not None and has_fit_parameter(model, "sample_weight"):
+            fit_kwargs["sample_weight"] = weights
+        if isinstance(model, TorchLinearRegression):
+            fit_kwargs["ridge"] = self.leaf_alpha
+            fit_kwargs["save_linear_propogation_uncertainty_parameters"] = (
+                save_linear_propogation_uncertainty_parameters
+            )
+            fit_kwargs["save_quadratic_uncertainty_parameters"] = (
+                save_quadratic_uncertainty_parameters
+            )
+
+        model.fit(X[:, self._linear_features], y, **fit_kwargs)
+        return model
+
+    def _split_with_iterative_leaf_models(self, X, y, weights, loss, thresholds, valid_thresholds):
+        best_split = None
+        loss_value = loss.item() if isinstance(loss, torch.Tensor) else loss
+
+        for threshold_idx in range(thresholds.shape[0]):
+            for split_feature_idx in range(thresholds.shape[1]):
+                if not valid_thresholds[threshold_idx, split_feature_idx].item():
+                    continue
+
+                split_col = int(self._split_features[split_feature_idx].item())
+                split_t = thresholds[threshold_idx, split_feature_idx].item()
+                below_mask = X[:, split_col] <= split_t
+                above_mask = ~below_mask
+
+                model_left = copy.deepcopy(self.base_estimator)
+                model_right = copy.deepcopy(self.base_estimator)
+                weights_left = weights[below_mask] if weights is not None else None
+                weights_right = weights[above_mask] if weights is not None else None
+
+                self._fit_leaf_model(model_left, X[below_mask], y[below_mask], weights_left)
+                self._fit_leaf_model(model_right, X[above_mask], y[above_mask], weights_right)
+
+                y_pred_left = model_left.predict(X[below_mask][:, self._linear_features])
+                y_pred_right = model_right.predict(X[above_mask][:, self._linear_features])
+
+                loss_left = torch.sum(
+                    self.loss_func(y[below_mask], y_pred_left, weights=weights_left)
+                ).item()
+                loss_right = torch.sum(
+                    self.loss_func(y[above_mask], y_pred_right, weights=weights_right)
+                ).item()
+                total_loss = loss_left + loss_right
+
+                if best_split is None or total_loss < best_split[0]:
+                    n_left = int(torch.sum(below_mask).item())
+                    n_right = int(torch.sum(above_mask).item())
+                    if weights is not None:
+                        wloss_left = loss_left * (weights_left.sum() / weights.sum()).item()
+                        wloss_right = loss_right * (weights_right.sum() / weights.sum()).item()
+                    else:
+                        wloss_left = loss_left * n_left / len(X)
+                        wloss_right = loss_right * n_right / len(X)
+
+                    best_split = (
+                        total_loss,
+                        split_t,
+                        split_col,
+                        (model_left, loss_left, wloss_left, n_left, {'classes': None}),
+                        (model_right, loss_right, wloss_right, n_right, {'classes': None}),
+                    )
+
+        if best_split is None or loss_value - best_split[0] < self.min_impurity_decrease:
+            return None, None, None, None
+
+        _, split_t, split_col, left_node, right_node = best_split
+        return split_t, split_col, left_node, right_node
 
     def _split(self, X, y,
                weights=None,
@@ -384,12 +711,16 @@ class _LinearTree(BaseDecisionTree):
         if len(X) < min_samples_leaf * 2:
             return None, None, None, None
 
-        # Ensure X has a bias term (column of ones)
-        X = torch.cat([torch.ones(X.shape[0], 1, device = X.device), X], dim=-1)
-        linear_features = torch.tensor([0, *(self._linear_features+1)], device = X.device)
+        X_split = X
+        if self.fit_intercept:
+            X_model = torch.cat([torch.ones(X.shape[0], 1, device = X.device), X], dim=-1)
+            linear_features = torch.tensor([0, *(self._linear_features+1)], device = X.device)
+        else:
+            X_model = X
+            linear_features = self._linear_features
 
         # Determine quantiles for all features based on the number of bins
-        X_nb = X[:, 1:][:, self._split_features]  # Exclude the bias term
+        X_nb = X_split[:, self._split_features]
         quantiles = torch.linspace(0, 1, self.max_bins + 1, device = X.device, dtype = X.dtype)
         thresholds = torch.quantile(X_nb, quantiles, dim=0)[1:-1]
 
@@ -405,16 +736,21 @@ class _LinearTree(BaseDecisionTree):
 
         if not torch.any(valid_thresholds):
             return None, None, None, None
+
+        if self.leaf_regularization != "ridge":
+            return self._split_with_iterative_leaf_models(
+                X_split, y, weights, loss, thresholds, valid_thresholds
+            )
         
         # Mask X and y tensors
-        X_below = torch.einsum('sf,bsc->cbsf', X, mask_below)
-        X_above = torch.einsum('sf,bsc->cbsf', X, mask_above)
+        X_below = torch.einsum('sf,bsc->cbsf', X_model, mask_below)
+        X_above = torch.einsum('sf,bsc->cbsf', X_model, mask_above)
         y_below = torch.einsum('st,bsc->cbst', y, mask_below)
         y_above = torch.einsum('st,bsc->cbst', y, mask_above)
 
         # Compute theta (linear regression parameters) for below and above thresholds
-        theta_below = compute_theta(X_below[:, :, :, linear_features], y_below, ridge=self.ridge)
-        theta_above = compute_theta(X_above[:, :, :, linear_features], y_above, ridge=self.ridge)
+        theta_below = compute_theta(X_below[:, :, :, linear_features], y_below, ridge=self.leaf_alpha)
+        theta_above = compute_theta(X_above[:, :, :, linear_features], y_above, ridge=self.leaf_alpha)
 
         # Make predictions
         y_pred_below = torch.einsum('cbsf, cbft -> cbst', X_below[:, :, :, linear_features], theta_below)
@@ -452,11 +788,11 @@ class _LinearTree(BaseDecisionTree):
             return None, None, None, None
         else:
             # Valid split found
-            split_col = best_feature_idx.item()
+            split_col = int(self._split_features[best_feature_idx].item())
             split_t = thresholds[best_threshold_idx, best_feature_idx].item()
 
             # Create TorchLinearRegressions for above and below
-            below_mask = X[:, split_col+1] <= split_t
+            below_mask = X_split[:, split_col] <= split_t
             above_mask = ~below_mask
 
             model_left = copy.deepcopy(self.base_estimator)
@@ -521,10 +857,12 @@ class _LinearTree(BaseDecisionTree):
         # initialize first fit
         largs = {'classes': None}
         model = deepcopy(self.base_estimator)
-        if weights is None or not support_sample_weight:
-            model.fit(X[:, self._linear_features], y)
-        else:
-            model.fit(X[:, self._linear_features], y, sample_weight=weights)
+        self._fit_leaf_model(
+            model,
+            X,
+            y,
+            weights=weights if support_sample_weight else None,
+        )
 
         if hasattr(self, 'classes_'):
             largs['classes'] = self.classes_
@@ -583,7 +921,10 @@ class _LinearTree(BaseDecisionTree):
             while len(queue) > 0:
                 pbar.update(1)
 
-                if torch.sum(mask) < 2 * self._min_samples_leaf:
+                if len(queue[active_index]) >= self.max_depth:
+                    split_t, split_col, left_node, right_node = None, None, None, None
+
+                elif torch.sum(mask) < 2 * self._min_samples_leaf:
                     split_t, split_col, left_node, right_node = None, None, None, None
 
                 elif (self.max_batch_size != torch.inf) and (torch.sum(mask) > self.max_batch_size):
@@ -798,10 +1139,13 @@ class _LinearTree(BaseDecisionTree):
         with torch.no_grad():
             self._grow(X, y, sample_weight)
 
-        # Fit TorchLinearRegression if the parameters copied from the splitting method are not enough
-        # For example, if UQ parameters are needed 
-
-        if self.save_linear_propogation_uncertainty_parameters or self.save_quadratic_uncertainty_parameters:
+        # Refit leaves when copied split parameters are not enough. This is
+        # required for sparse iterative leaf estimators and for UQ parameters.
+        if (
+            self.leaf_regularization != "ridge"
+            or self.save_linear_propogation_uncertainty_parameters
+            or self.save_quadratic_uncertainty_parameters
+        ):
             X_leaves = torch.zeros((X.shape[0],), dtype=torch.int, device = X.device)
 
             for L in self._leaves.values():
@@ -812,13 +1156,18 @@ class _LinearTree(BaseDecisionTree):
 
             for i in range(len(self._leaves)):
                 node_id = self._leaves[leaves[i]].id
-                self._leaves[leaves[i]].model.fit(
-                    X[X_leaves==node_id][:, self._linear_features],
-                    y[X_leaves==node_id],
+                leaf_mask = X_leaves == node_id
+                leaf_weights = sample_weight[leaf_mask] if sample_weight is not None else None
+                leaf_model = copy.deepcopy(self.base_estimator)
+                self._fit_leaf_model(
+                    leaf_model,
+                    X[leaf_mask],
+                    y[leaf_mask],
+                    weights=leaf_weights,
                     save_linear_propogation_uncertainty_parameters = self.save_linear_propogation_uncertainty_parameters,
                     save_quadratic_uncertainty_parameters = self.save_quadratic_uncertainty_parameters,
-
-                    )
+                )
+                self._leaves[leaves[i]].model = leaf_model
 
         return self
 
@@ -936,17 +1285,7 @@ class _LinearTree(BaseDecisionTree):
         """
         check_is_fitted(self, attributes='_nodes')
 
-        X = self._validate_data(
-            X,
-            reset=False,
-            accept_sparse=False,
-            dtype='float32',
-            force_all_finite=True,
-            ensure_2d=True,
-            allow_nd=False,
-            ensure_min_features=self.n_features_in_,
-            cast_to_ndarray = False,
-        )
+        X = _validate_tree_input(self, X)
 
         X_leaves = torch.zeros((X.shape[0],), dtype=torch.int, device = X.device)
 
@@ -974,17 +1313,7 @@ class _LinearTree(BaseDecisionTree):
         """
         check_is_fitted(self, attributes='_nodes')
 
-        X = self._validate_data(
-            X,
-            reset=False,
-            accept_sparse=False,
-            dtype='float32',
-            force_all_finite=True,
-            ensure_2d=True,
-            allow_nd=False,
-            ensure_min_features=self.n_features_in_,
-            cast_to_ndarray = False,
-        )
+        X = _validate_tree_input(self, X)
 
         indicator = torch.zeros((X.shape[0], self.node_count), dtype='int64')
 

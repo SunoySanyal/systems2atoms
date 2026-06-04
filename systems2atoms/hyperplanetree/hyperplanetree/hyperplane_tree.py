@@ -301,6 +301,35 @@ class HyperplaneTreeRegressor(HyperplaneMixin, LinearTreeRegressor):
     ridge : float, default = 1e-5
         Regularization parameter for the linear models in the leaves.
         A higher value implies a higher regularization.
+        Kept as a backwards-compatible alias for ``leaf_alpha`` when
+        ``leaf_alpha`` is not provided.
+
+    leaf_regularization : {'ridge', 'lasso', 'elasticnet'}, default='ridge'
+        Regularization to use for the linear models in the leaves. ``ridge``
+        preserves the existing torch closed-form solve. ``lasso`` and
+        ``elasticnet`` use scikit-learn iterative solvers and can produce
+        sparse leaf coefficients.
+
+    leaf_alpha : float or None, default=None
+        Regularization strength for the leaf models. If None, the value of
+        ``ridge`` is used. For scikit-learn Lasso/ElasticNet, the squared-error
+        term is normalized by ``1 / (2 * n_samples)``.
+
+    leaf_l1_ratio : float, default=0.5
+        Elastic-Net mixing parameter. ``1.0`` is Lasso-like and ``0.0`` is
+        ridge-like in scikit-learn's ElasticNet objective.
+
+    fit_intercept : bool, default=True
+        Whether the leaf linear models fit an intercept.
+
+    max_iter : int, default=1000
+        Maximum iterations for Lasso and Elastic-Net leaf solvers.
+
+    tol : float, default=1e-4
+        Optimization tolerance for Lasso and Elastic-Net leaf solvers.
+
+    random_state : int, RandomState instance or None, default=None
+        Random state forwarded to Lasso and Elastic-Net.
     """
 
     def __init__(
@@ -327,6 +356,13 @@ class HyperplaneTreeRegressor(HyperplaneMixin, LinearTreeRegressor):
         max_batch_size = torch.inf,
         depth_first = True,
         ridge = 1e-5,
+        leaf_regularization = "ridge",
+        leaf_alpha = None,
+        leaf_l1_ratio = 0.5,
+        fit_intercept = True,
+        max_iter = 1000,
+        tol = 1e-4,
+        random_state = None,
 
         ):
         HyperplaneMixin.__init__(
@@ -344,19 +380,26 @@ class HyperplaneTreeRegressor(HyperplaneMixin, LinearTreeRegressor):
 
         LinearTreeRegressor.__init__(
             self,
-            criterion,
-            max_depth,
-            min_samples_split,
-            min_samples_leaf,
-            max_bins,
-            min_impurity_decrease,
-            categorical_features,
-            split_features,
-            linear_features,
-            disable_tqdm,
-            save_linear_propogation_uncertainty_parameters,
-            save_quadratic_uncertainty_parameters,
-            max_batch_size,
-            depth_first,
-            ridge,
+            criterion=criterion,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            min_samples_leaf=min_samples_leaf,
+            max_bins=max_bins,
+            min_impurity_decrease=min_impurity_decrease,
+            categorical_features=categorical_features,
+            split_features=split_features,
+            linear_features=linear_features,
+            disable_tqdm=disable_tqdm,
+            save_linear_propogation_uncertainty_parameters=save_linear_propogation_uncertainty_parameters,
+            save_quadratic_uncertainty_parameters=save_quadratic_uncertainty_parameters,
+            max_batch_size=max_batch_size,
+            depth_first=depth_first,
+            ridge=ridge,
+            leaf_regularization=leaf_regularization,
+            leaf_alpha=leaf_alpha,
+            leaf_l1_ratio=leaf_l1_ratio,
+            fit_intercept=fit_intercept,
+            max_iter=max_iter,
+            tol=tol,
+            random_state=random_state,
         )
