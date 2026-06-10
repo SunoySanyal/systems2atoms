@@ -307,8 +307,10 @@ class HyperplaneTreeRegressor(HyperplaneMixin, LinearTreeRegressor):
     leaf_regularization : {'ridge', 'lasso', 'elasticnet'}, default='ridge'
         Regularization to use for the linear models in the leaves. ``ridge``
         preserves the existing torch closed-form solve. ``lasso`` and
-        ``elasticnet`` use scikit-learn iterative solvers and can produce
-        sparse leaf coefficients.
+        ``elasticnet`` search splits with the closed-form ridge solve (using
+        ``ridge`` as the search regularization strength), then refit the final
+        leaves with scikit-learn iterative solvers, which can produce sparse
+        leaf coefficients.
 
     leaf_alpha : float or None, default=None
         Regularization strength for the leaf models. If None, the value of

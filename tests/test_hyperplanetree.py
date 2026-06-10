@@ -101,6 +101,44 @@ def test_leaf_regularization_modes_fit_and_report_coefficients():
         for coef in leaf_coefficients(model):
             assert coef.numel() == features.shape[1]
 
+def test_hyperplanetree_with_elasticnet_leaves():
+    features, labels = generate_sparse_linear_data()
+    model = HyperplaneTreeRegressor(
+        max_depth=2,
+        min_samples_leaf=15,
+        max_bins=4,
+        disable_tqdm=True,
+        leaf_regularization="elasticnet",
+        leaf_alpha=0.01,
+        leaf_l1_ratio=0.5,
+        max_iter=10000,
+        tol=1e-6,
+        random_state=0,
+    )
+    model.fit(features, labels)
+
+    predictions = model.predict(features[:5])
+    assert predictions.reshape(-1).shape == labels[:5].shape
+    assert len(model) >= 1
+
+def test_sparse_leaf_uncertainty_raises_clear_error():
+    import pytest
+
+    features, labels = generate_sparse_linear_data()
+    model = LinearTreeRegressor(
+        max_depth=1,
+        min_samples_leaf=20,
+        max_bins=4,
+        disable_tqdm=True,
+        leaf_regularization="elasticnet",
+        leaf_alpha=0.05,
+        random_state=0,
+    )
+    model.fit(features, labels)
+
+    with pytest.raises(NotImplementedError, match="ridge"):
+        model.uncertainty(features[:5])
+
 def test_l1_leaf_regularization_can_zero_coefficients():
     features, labels = generate_sparse_linear_data()
     model = LinearTreeRegressor(

@@ -274,7 +274,9 @@ class QuadricTreeRegressor(QuadricMixin, LinearTreeRegressor):
         ``leaf_alpha`` is not provided.
 
     leaf_regularization : {'ridge', 'lasso', 'elasticnet'}, default='ridge'
-        Regularization to use for the linear models in the leaves.
+        Regularization to use for the linear models in the leaves. ``lasso``
+        and ``elasticnet`` search splits with the closed-form ridge solve and
+        refit the final leaves with scikit-learn iterative solvers.
 
     leaf_alpha : float or None, default=None
         Regularization strength for the leaf models. If None, the value of

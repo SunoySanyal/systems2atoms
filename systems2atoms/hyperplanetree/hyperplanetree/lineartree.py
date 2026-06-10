@@ -6,7 +6,7 @@ from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.utils.validation import check_is_fitted, _check_sample_weight
 from tqdm.auto import tqdm
 
-from ._classes import make_leaf_regressor, _LinearTree, _LinearForest, _predict_branch
+from ._classes import _LinearTree, _LinearForest, _predict_branch
 
 class LinearTreeRegressor(_LinearTree, RegressorMixin):
     """A Linear Tree Regressor.
@@ -119,8 +119,10 @@ class LinearTreeRegressor(_LinearTree, RegressorMixin):
     leaf_regularization : {'ridge', 'lasso', 'elasticnet'}, default='ridge'
         Regularization to use for the linear models in the leaves. ``ridge``
         preserves the existing torch closed-form solve. ``lasso`` and
-        ``elasticnet`` use scikit-learn iterative solvers and can produce
-        sparse leaf coefficients.
+        ``elasticnet`` search splits with the closed-form ridge solve (using
+        ``ridge`` as the search regularization strength), then refit the final
+        leaves with scikit-learn iterative solvers, which can produce sparse
+        leaf coefficients.
 
     leaf_alpha : float or None, default=None
         Regularization strength for the leaf models. If None, the value of
@@ -171,19 +173,10 @@ class LinearTreeRegressor(_LinearTree, RegressorMixin):
         random_state = None,
         ):
 
-        leaf_alpha_value = ridge if leaf_alpha is None else leaf_alpha
-        self.base_estimator = make_leaf_regressor(
-            regularization=leaf_regularization,
-            alpha=leaf_alpha_value,
-            l1_ratio=leaf_l1_ratio,
-            fit_intercept=fit_intercept,
-            max_iter=max_iter,
-            tol=tol,
-            random_state=random_state,
-        )
-
+        # _LinearTree.__init__ builds the leaf regressor via make_leaf_regressor
+        # when base_estimator is None.
         super().__init__(
-            base_estimator = self.base_estimator,
+            base_estimator = None,
             criterion = criterion,
             max_depth = max_depth,
             min_samples_split = min_samples_split,

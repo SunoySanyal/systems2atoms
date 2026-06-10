@@ -446,6 +446,12 @@ class SklearnLeafRegressor(BaseEstimator, RegressorMixin):
         """Pad reported coefficients with zeros for generated split features."""
         self._coef_padding = max(0, n_features - self.n_features_in_)
 
+    def uncertainty(self, x, method='linprop'):
+        raise NotImplementedError(
+            "Uncertainty quantification is only available with "
+            "leaf_regularization='ridge' (TorchLinearRegression leaves)."
+        )
+
     def to(self, device):
         return self
 
@@ -605,63 +611,6 @@ class _LinearTree(BaseDecisionTree):
         model.fit(X[:, self._linear_features], y, **fit_kwargs)
         return model
 
-    def _split_with_iterative_leaf_models(self, X, y, weights, loss, thresholds, valid_thresholds):
-        best_split = None
-        loss_value = loss.item() if isinstance(loss, torch.Tensor) else loss
-
-        for threshold_idx in range(thresholds.shape[0]):
-            for split_feature_idx in range(thresholds.shape[1]):
-                if not valid_thresholds[threshold_idx, split_feature_idx].item():
-                    continue
-
-                split_col = int(self._split_features[split_feature_idx].item())
-                split_t = thresholds[threshold_idx, split_feature_idx].item()
-                below_mask = X[:, split_col] <= split_t
-                above_mask = ~below_mask
-
-                model_left = copy.deepcopy(self.base_estimator)
-                model_right = copy.deepcopy(self.base_estimator)
-                weights_left = weights[below_mask] if weights is not None else None
-                weights_right = weights[above_mask] if weights is not None else None
-
-                self._fit_leaf_model(model_left, X[below_mask], y[below_mask], weights_left)
-                self._fit_leaf_model(model_right, X[above_mask], y[above_mask], weights_right)
-
-                y_pred_left = model_left.predict(X[below_mask][:, self._linear_features])
-                y_pred_right = model_right.predict(X[above_mask][:, self._linear_features])
-
-                loss_left = torch.sum(
-                    self.loss_func(y[below_mask], y_pred_left, weights=weights_left)
-                ).item()
-                loss_right = torch.sum(
-                    self.loss_func(y[above_mask], y_pred_right, weights=weights_right)
-                ).item()
-                total_loss = loss_left + loss_right
-
-                if best_split is None or total_loss < best_split[0]:
-                    n_left = int(torch.sum(below_mask).item())
-                    n_right = int(torch.sum(above_mask).item())
-                    if weights is not None:
-                        wloss_left = loss_left * (weights_left.sum() / weights.sum()).item()
-                        wloss_right = loss_right * (weights_right.sum() / weights.sum()).item()
-                    else:
-                        wloss_left = loss_left * n_left / len(X)
-                        wloss_right = loss_right * n_right / len(X)
-
-                    best_split = (
-                        total_loss,
-                        split_t,
-                        split_col,
-                        (model_left, loss_left, wloss_left, n_left, {'classes': None}),
-                        (model_right, loss_right, wloss_right, n_right, {'classes': None}),
-                    )
-
-        if best_split is None or loss_value - best_split[0] < self.min_impurity_decrease:
-            return None, None, None, None
-
-        _, split_t, split_col, left_node, right_node = best_split
-        return split_t, split_col, left_node, right_node
-
     def _split(self, X, y,
                weights=None,
                loss=None, min_samples_leaf=3):
@@ -737,11 +686,15 @@ class _LinearTree(BaseDecisionTree):
         if not torch.any(valid_thresholds):
             return None, None, None, None
 
-        if self.leaf_regularization != "ridge":
-            return self._split_with_iterative_leaf_models(
-                X_split, y, weights, loss, thresholds, valid_thresholds
-            )
-        
+        # Splits are always searched with the closed-form ridge solve, even for
+        # sparse leaf regularization. Sparse leaves are refit at the end of
+        # _fit(). Use the plain ridge strength for the search since sklearn's
+        # alpha is on a different scale.
+        if self.leaf_regularization == "ridge":
+            search_ridge = self.leaf_alpha
+        else:
+            search_ridge = self.ridge
+
         # Mask X and y tensors
         X_below = torch.einsum('sf,bsc->cbsf', X_model, mask_below)
         X_above = torch.einsum('sf,bsc->cbsf', X_model, mask_above)
@@ -749,8 +702,8 @@ class _LinearTree(BaseDecisionTree):
         y_above = torch.einsum('st,bsc->cbst', y, mask_above)
 
         # Compute theta (linear regression parameters) for below and above thresholds
-        theta_below = compute_theta(X_below[:, :, :, linear_features], y_below, ridge=self.leaf_alpha)
-        theta_above = compute_theta(X_above[:, :, :, linear_features], y_above, ridge=self.leaf_alpha)
+        theta_below = compute_theta(X_below[:, :, :, linear_features], y_below, ridge=search_ridge)
+        theta_above = compute_theta(X_above[:, :, :, linear_features], y_above, ridge=search_ridge)
 
         # Make predictions
         y_pred_below = torch.einsum('cbsf, cbft -> cbst', X_below[:, :, :, linear_features], theta_below)
@@ -795,9 +748,15 @@ class _LinearTree(BaseDecisionTree):
             below_mask = X_split[:, split_col] <= split_t
             above_mask = ~below_mask
 
-            model_left = copy.deepcopy(self.base_estimator)
-            model_right = copy.deepcopy(self.base_estimator)
-            
+            if isinstance(self.base_estimator, TorchLinearRegression):
+                model_left = copy.deepcopy(self.base_estimator)
+                model_right = copy.deepcopy(self.base_estimator)
+            else:
+                # Sparse leaf regressors cannot hold the closed-form theta;
+                # use torch placeholders, replaced by the refit in _fit().
+                model_left = TorchLinearRegression(fit_intercept=self.fit_intercept)
+                model_right = TorchLinearRegression(fit_intercept=self.fit_intercept)
+
             # Copy regression weights from computed "theta"
             # Will be re-fitted at the end of _LinearTree.fit() if needed
             model_left.params = theta_below[best_feature_idx, best_threshold_idx]
